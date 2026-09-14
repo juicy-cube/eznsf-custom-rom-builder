@@ -106,6 +106,7 @@ class EZNSFBuilder(TkinterDnD.Tk):
         ttk.Button(self.btn_frame, text="Add NSF Manually", command=self.add_nsf).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.btn_frame, text="Load Album", command=self.load_album).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.btn_frame, text="Clear List", command=self.clear_list).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.btn_frame, text="Save album.txt as...", command=self.save_album_as).pack(side=tk.LEFT, padx=5)
         
         bold_style = ttk.Style()
         bold_style.configure("Bold.TButton", font=('Sans', 10, 'bold'))
@@ -324,64 +325,87 @@ class EZNSFBuilder(TkinterDnD.Tk):
 
         messagebox.showinfo("Success", f"Loaded album from:\n{path}")
                 
+    def _generate_album_text(self):
+        lines = []
+        lines.append("NROM 0")
+        lines.append(f"TITLE {self.entries['TITLE'].get()}")
+        lines.append(f"COPYRIGHT {self.entries['COPYRIGHT'].get()}")
+        lines.append(f"PLAYALL {self.entries['PLAY ALL'].get()}")
+        lines.append(f"INFOTEXT {self.entries['INFOTEXT'].get()}")
+        lines.append(f"LOOPTIME {self.entries['LOOPTIME'].get()}")
+        lines.append("")
+        # Always written explicitly (0 or 1) rather than only when enabled,
+        # so a saved album.txt fully reflects both checkboxes' state instead
+        # of silently relying on eznsf.py's own defaults.
+        lines.append(f"AUTOFIX {1 if self.autofix_var.get() else 0}")
+        lines.append(f"AUTONUMERATE {1 if self.autonumerate_var.get() else 0}")
+        lines.append("")
+
+        for line in self.info_text.get("1.0", tk.END).splitlines():
+            if line.strip():
+                lines.append(f"INFO {line}")
+        lines.append("")
+
+        current_nsf = None
+        current_artist = None
+
+        for child in self.tree.get_children():
+            row = self.tree.item(child)["values"]
+            # Tkinter's Treeview silently converts numeric-looking cell
+            # text (e.g. a copyright of just "2026") back to int/float
+            # when read via item()["values"], so every field needs an
+            # explicit str() here regardless of what it looks like.
+            file_name, subsong, artist, title, copyright_val, time_val = (str(v) for v in row)
+            nsf_path = self.nsf_full_paths.get(child, file_name)
+
+            if nsf_path != current_nsf:
+                lines.append(f"\nNSF {nsf_path}")
+                lines.append(f"ARTIST {artist}")
+                current_nsf = nsf_path
+                current_artist = artist
+            elif artist != current_artist:
+                lines.append(f"ARTIST {artist}")
+                current_artist = artist
+
+            lines.append(f"TRACK {subsong} {title}")
+            lines.append(f"TIME {subsong} {time_val}")
+            if copyright_val.strip():
+                lines.append(f"COPY {subsong} {copyright_val}")
+
+        lines.append("\nSCREEN INFO   screen.nam   tiles.chr tiles.chr colors.pal colors.pal")
+        lines.append("SCREEN TRACKS screen.nam tiles.chr tiles.chr colors.pal colors.pal")
+        lines.append("SCREEN PLAY   screen.nam   tiles.chr tiles.chr colors.pal colors.pal")
+
+        lines.append("\nCOORD INFO              2 2")
+        lines.append("COORD TRACKS_TITLE      2 2")
+        lines.append("COORD TRACKS_COPYRIGHT  2 4")
+        lines.append("COORD TRACKS_TRACK      4 6")
+        lines.append("COORD PLAY_TRACK        2 20")
+        lines.append("COORD PLAY_TIME         16 195")
+
+        lines.append("\nCONST SPRITE_CHOOSE 4\nCONST SPRITE_PLAY 8\nCONST SPRITE_PLAY_ALL 4")
+        lines.append("CONST SPRITE_PAUSE 6\nCONST SPRITE_STOP 7\nCONST SPRITE_ZERO 48\nCONST SPRITE_COLON 58")
+
+        return "\n".join(lines) + "\n"
+
+    def save_album_as(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Album files", "*.txt"), ("All files", "*.*")],
+            initialfile="album.txt")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self._generate_album_text())
+            messagebox.showinfo("Success", f"Saved album file to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save album file: {e}")
+
     def build_rom(self):
         album_path = os.path.join(PROJECT_DIR, "album.txt")
         with open(album_path, "w", encoding="utf-8") as f:
-            f.write("NROM 0\n")
-            f.write(f"TITLE {self.entries['TITLE'].get()}\n")
-            f.write(f"COPYRIGHT {self.entries['COPYRIGHT'].get()}\n")
-            f.write(f"PLAYALL {self.entries['PLAY ALL'].get()}\n")
-            f.write(f"INFOTEXT {self.entries['INFOTEXT'].get()}\n")
-            f.write(f"LOOPTIME {self.entries['LOOPTIME'].get()}\n\n")
-            if self.autofix_var.get():
-                f.write("AUTOFIX 1\n\n")
-            if self.autonumerate_var.get():
-                f.write("AUTONUMERATE 1\n\n")
-            
-            for line in self.info_text.get("1.0", tk.END).splitlines():
-                if line.strip(): 
-                    f.write(f"INFO {line}\n")
-            f.write("\n")
-            
-            current_nsf = None
-            current_artist = None
-
-            for child in self.tree.get_children():
-                row = self.tree.item(child)["values"]
-                # Tkinter's Treeview silently converts numeric-looking cell
-                # text (e.g. a copyright of just "2026") back to int/float
-                # when read via item()["values"], so every field needs an
-                # explicit str() here regardless of what it looks like.
-                file_name, subsong, artist, title, copyright_val, time_val = (str(v) for v in row)
-                nsf_path = self.nsf_full_paths.get(child, file_name)
-
-                if nsf_path != current_nsf:
-                    f.write(f"\nNSF {nsf_path}\n")
-                    f.write(f"ARTIST {artist}\n")
-                    current_nsf = nsf_path
-                    current_artist = artist
-                elif artist != current_artist:
-                    f.write(f"ARTIST {artist}\n")
-                    current_artist = artist
-                    
-                f.write(f"TRACK {subsong} {title}\n")
-                f.write(f"TIME {subsong} {time_val}\n")
-                if copyright_val.strip():
-                    f.write(f"COPY {subsong} {copyright_val}\n")
-                    
-            f.write("\nSCREEN INFO   screen.nam   tiles.chr tiles.chr colors.pal colors.pal\n")
-            f.write("SCREEN TRACKS screen.nam tiles.chr tiles.chr colors.pal colors.pal\n")
-            f.write("SCREEN PLAY   screen.nam   tiles.chr tiles.chr colors.pal colors.pal\n")
-            
-            f.write("\nCOORD INFO              2 2\n")
-            f.write("COORD TRACKS_TITLE      2 2\n")
-            f.write("COORD TRACKS_COPYRIGHT  2 4\n")
-            f.write("COORD TRACKS_TRACK      4 6\n")
-            f.write("COORD PLAY_TRACK        2 20\n")
-            f.write("COORD PLAY_TIME         16 195\n")
-            
-            f.write("\nCONST SPRITE_CHOOSE 4\nCONST SPRITE_PLAY 8\nCONST SPRITE_PLAY_ALL 4\n")
-            f.write("CONST SPRITE_PAUSE 6\nCONST SPRITE_STOP 7\nCONST SPRITE_ZERO 48\nCONST SPRITE_COLON 58\n")
+            f.write(self._generate_album_text())
 
         self.build_button.config(state=tk.DISABLED, text="Building...")
         threading.Thread(target=self._run_build, args=(album_path,), daemon=True).start()

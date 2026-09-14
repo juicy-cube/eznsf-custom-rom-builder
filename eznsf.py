@@ -276,6 +276,37 @@ print()
 nsf_banks = 0
 nsf_dropped = []  # (index, file, reason) for albums AUTOFIX couldn't safely fix
 nsf_status_report = []  # (original_file, status, detail) for every NSF, in order
+MAX_TOTAL_BANKS = 256   # mapper 31's hard limit: $5FF8-$5FFF are single bytes
+
+def estimate_banks(nsf_file, header):
+    """Cheap, header-only replica of the highest_bank computation done
+    below, used for a fast pre-check -- reads no more than 0x80 bytes."""
+    banked = any(b != 0 for b in header[0x70:0x78])
+    if not banked:
+        return 7  # non-banked NSFs always occupy all 8 windows, see below
+    return max(header[0x70:0x78])
+
+if nsf_nrom == 0:
+    # Fail fast on a plainly-too-large album *before* spending any time on
+    # AUTOFIX's per-NSF emulation pass -- there's no point spending minutes
+    # patching NSFs one by one only to find out ca65 can't fit them anyway.
+    # A margin is reserved for the PPU graphics banks and the at-least-one
+    # menu/idle bank added later, once graphics are compressed and sized.
+    running_bank_total = 0
+    for alb in nsf_albums:
+        try:
+            header = open(alb["file"], "rb").read(0x80)
+        except:
+            continue  # a missing/unreadable file is reported properly below
+        if len(header) < 0x80:
+            continue
+        running_bank_total += estimate_banks(alb["file"], header) + 1
+        if running_bank_total > MAX_TOTAL_BANKS - 8:
+            errmsg(
+                "Total ROM size is too large for this mapper after adding '%s': "
+                "roughly %d x 4K banks needed so far, only %d are available in total. "
+                "Remove some NSF files, use shorter/simpler ones, or split the album "
+                "into more than one ROM." % (alb["file"], running_bank_total, MAX_TOTAL_BANKS))
 
 for orig_idx, alb in enumerate(nsf_albums):
     nsf_file = alb["file"]
