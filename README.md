@@ -26,5 +26,6 @@ It all depends on the internal player used. I encourage you to test it.
 
 CHANGELOG
 -
-2026.09.21: Experimental feature - forcing speed (NTSC/PAL)
+2026.09.21: Experimental feature - forcing speed NTSC/PAL
+
 2026.09.13: v1.0 Initial release
