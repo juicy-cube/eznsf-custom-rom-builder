@@ -19,4 +19,5 @@ it causes errors and glitches. Needs further development.
 
 CHANGELOG
 -
-2026.09: v1.0 Initial release
+2026.09.21: Experimental feature: forcing speed (NTSC/PAL)
+2026.09.13: v1.0 Initial release
