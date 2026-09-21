@@ -367,6 +367,111 @@ def patch_nsf(path, out_path=None, verbose=True):
     return report
 
 
+PERIOD_REGS = (0x4002, 0x4003, 0x4006, 0x4007, 0x400A, 0x400B)  # pulse1/pulse2/triangle period lo/hi
+COMPENSATION_FRAMES = 180  # ~3 seconds worth of PLAY calls per measurement
+
+
+class RegionCompensationProbe:
+    """Measures how much a tune's own compiled engine speeds up its
+    internal note/row advancement when told (via X at INIT) that it's
+    running on PAL vs NTSC -- independent of anything this driver does.
+    Used to calibrate the PLAY-rate throttle per file instead of assuming
+    a fixed ratio, since only some engines (FamiTracker's being the
+    common case) self-compensate for the region at all; others (hand-
+    written engines in particular) don't and would be doubly-corrected by
+    a blanket assumption.
+    """
+
+    def __init__(self, rom, bank):
+        self.cur_bank = list(bank)
+        subject = [0x00] * 0x10000
+        mem = ObservableMemory(subject=subject)
+        mem.subscribe_to_read(range(0x8000, 0x10000), self._read_rom)
+        mem.subscribe_to_write(range(0x5FF8, 0x6000), self._write_bank)
+        mem.subscribe_to_write(PERIOD_REGS, self._write_period)
+        self.mem = mem
+        self.mpu = MPU(memory=mem)
+        self.rom = rom
+        self.note_events = 0
+
+    def _read_rom(self, address):
+        rel = address - 0x8000
+        window = rel >> 12
+        src = self.cur_bank[window] * 0x1000 + (rel & 0xFFF)
+        return self.rom[src] if src < len(self.rom) else 0
+
+    def _write_bank(self, address, value):
+        window = address - 0x5FF8
+        if 0 <= window <= 7:
+            self.cur_bank[window] = value
+        return None
+
+    def _write_period(self, address, value):
+        # Every write to a period register is counted as one unit of
+        # "the engine is actively sequencing" activity; an engine that
+        # advances its rows/notes faster per call produces more of these
+        # over the same number of PLAY calls, regardless of what it's
+        # actually playing.
+        self.note_events += 1
+        return None
+
+    def _run_to_sentinel(self, entry, a, x, y, budget=STEP_BUDGET):
+        m = self.mem
+        sp = self.mpu.sp if self.mpu.sp else 0xFD
+        ret = SENTINEL - 1
+        m[0x0100 + sp] = (ret >> 8) & 0xFF
+        m[0x0100 + ((sp - 1) & 0xFF)] = ret & 0xFF
+        self.mpu.sp = (sp - 2) & 0xFF
+        self.mpu.pc = entry
+        self.mpu.a, self.mpu.x, self.mpu.y = a, x, y
+        steps = 0
+        while self.mpu.pc != SENTINEL and steps < budget:
+            self.mpu.step()
+            steps += 1
+        return steps < budget
+
+    def run(self, init, play, song_index, region_x, frames):
+        ok = self._run_to_sentinel(init, song_index, region_x, 0x00)
+        if not ok:
+            return None
+        for _ in range(frames):
+            ok = self._run_to_sentinel(play, 0x00, 0x00, 0x00)
+            if not ok:
+                return None
+        return self.note_events
+
+
+def measure_pal_compensation(rom, bank, init, play, song_count, frames=COMPENSATION_FRAMES):
+    """Returns how much faster (as a multiplier) this tune's own engine
+    advances when it's told it's on PAL vs NTSC, e.g. 1.2 (6/5) for a
+    typical self-compensating FamiTracker export, or 1.0 for an engine
+    that doesn't react to the region byte at all.
+
+    The measurement (counting period-register writes over a fixed window)
+    is only trusted as a yes/no detector, not as a precise ratio: FamiTracker's
+    compiled driver always uses exactly 6/5 when it does compensate, and
+    snapping to that known-exact constant instead of the noisy measured
+    value avoids small residual errors that only show up over a longer
+    listen. Anything measured close to 1.0 is treated as "doesn't
+    compensate at all" and left at 1.0 -- the safer default when unsure,
+    since that's the same as not correcting.
+    """
+    try:
+        song = 0
+        ntsc_probe = RegionCompensationProbe(bytearray(rom), bank)
+        ntsc_count = ntsc_probe.run(init, play, song, 0, frames)
+        pal_probe = RegionCompensationProbe(bytearray(rom), bank)
+        pal_count = pal_probe.run(init, play, song, 1, frames)
+        if not ntsc_count or not pal_count or ntsc_count < 4:
+            return 1.0
+        ratio = pal_count / ntsc_count
+        if ratio < 1.03:
+            return 1.0
+        return 6.0 / 5.0
+    except Exception:
+        return 1.0
+
+
 def autofix_rom(rom, bank, init, play, region, song_count):
     """Library entry point for eznsf.py: attempts to relocate a tune's own
     reserved-memory references directly on an in-memory rom blob (as already

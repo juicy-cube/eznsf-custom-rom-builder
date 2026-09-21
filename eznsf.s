@@ -32,6 +32,8 @@ temp:         .res 2
 play_album:     .res 1
 play_bank_f000: .res 1
 debounce_a:   .res 1
+play_rate_acc:    .res 1  ; Bresenham-style accumulator for the PLAY-rate throttle
+play_target_rate: .res 1  ; this track's intended PLAY rate in Hz (dNSF::rate_table)
 
 PAD_A      = $01
 PAD_B      = $02
@@ -460,6 +462,45 @@ PAD_R      = $80
 	ldx play_album
 	lda dNSF::bankf000_table, X
 	sta play_bank_f000
+	; A dual-region-aware tune is trusted to compensate for whatever rate
+	; it's actually called at, so it just gets the real native rate (no
+	; throttling at all). Anything else gets throttled to exactly the
+	; rate its own header/REGION override declares, on ANY hardware --
+	; play_play's generalized rate converter can both slow down and
+	; (by calling PLAY more than once in a single real frame when
+	; needed) speed up relative to the real native rate, so the declared
+	; rate is always achievable regardless of what real hardware this
+	; happens to run on.
+	;
+	; X always carries the REAL detected region (see "ldx pal" in
+	; ramcode_nsf_init below), never the configured one, regardless of
+	; any of the above: many engines pick their NOTE PERIOD (pitch)
+	; tables from X, and those have to match the APU's actual physical
+	; clock (NTSC and PAL run at different frequencies) -- lying about
+	; that produces wrong pitch. Some engines (FamiTracker-style ones
+	; specifically -- detected at build time, see dual_table's own
+	; comment) also use X to drive their own internal tempo
+	; self-compensation, independent of anything we do: on real PAL
+	; hardware they multiply their own per-call advance by exactly 6/5,
+	; regardless of our own achieved call rate. For those, and only on
+	; real PAL hardware, pre-dividing our call-rate target by that same
+	; 6/5 (rate_table_pal_adjusted) cancels it back out so the combined
+	; *result* matches the declared target instead of overshooting it.
+	lda dNSF::dual_table, X
+	bne @use_native_rate
+		lda pal
+		beq @use_ntsc_rate
+			lda dNSF::rate_table_pal_adjusted, X
+			jmp @rate_set
+		@use_ntsc_rate:
+		lda dNSF::rate_table, X
+		jmp @rate_set
+	@use_native_rate:
+		lda fps
+	@rate_set:
+	sta play_target_rate
+	lda #0
+	sta play_rate_acc
 	ldx track_choose
 	lda dTrack::song_table, X
 	jmp ramcode_nsf_init
@@ -689,7 +730,45 @@ ramcode_pin_and_enter_play_loop:
 	beq :+
 		rts
 	:
-	jsr ramcode_nsf_play
+	; PLAY-rate throttle: call the tune's PLAY routine exactly
+	; play_target_rate times per second of real hardware time (fps),
+	; regardless of what fps actually is -- including calling it MORE
+	; than once in a single real frame when the target exceeds the real
+	; native rate (a slower console physically fires fewer NMIs per
+	; second than a faster one demands; catching up like this is the only
+	; way to still hit the declared rate rather than being capped at
+	; whatever the real hardware allows). This is a plain generalized
+	; Bresenham rate converter -- it doesn't know or care whether the
+	; tune's own engine does anything extra based on the real region it
+	; was also told via X in ramcode_nsf_init; it only controls how often
+	; PLAY itself gets invoked. See play_target_rate's assignment in
+	; play_init for where the target itself comes from.
+	lda play_rate_acc
+	clc
+	adc play_target_rate
+@throttle_loop:
+	cmp fps
+	bcc @throttle_done
+		sbc fps
+		sta play_rate_acc
+		jsr ramcode_nsf_play
+		lda play_rate_acc
+		cmp fps
+		bcc @reload
+			; Another call is due this same real frame (catching up to a
+			; target faster than native) -- give hand-tuned, cycle-timing
+			; sensitive engines something closer to a real elapsed
+			; interval instead of calling them back-to-back with zero
+			; real time between the two. Doesn't change *how many* calls
+			; happen (tempo is unaffected either way), only spaces them
+			; out a little; experimental, since exactly how sensitive any
+			; given engine is to this can't be known in general.
+			jsr throttle_spacer
+		@reload:
+		lda play_rate_acc
+		jmp @throttle_loop
+	@throttle_done:
+	sta play_rate_acc
 	inc frame
 	lda frame
 	cmp fps
@@ -743,6 +822,23 @@ ramcode_pin_and_enter_play_loop:
 		lda #0
 		sta $4015
 	@second_end:
+	rts
+.endproc
+
+; Used by play_play's PLAY-rate throttle when it needs to call PLAY more
+; than once within the same real frame (see the comment there). ~5000
+; cycles -- a modest fraction of even a PAL frame -- inserted between two
+; such calls instead of running them back-to-back with no real time
+; between them at all.
+.proc throttle_spacer
+	ldy #20
+	@outer:
+		ldx #83
+		@inner:
+			dex
+			bne @inner
+		dey
+		bne @outer
 	rts
 .endproc
 
@@ -1124,36 +1220,32 @@ nsf_nrom:
 
 .endif
 
-.if (eNSF::REGION & 2)
-	.segment "ALIGN"
-	.proc detect_region
-		.align 32
-		ldx #0
-		ldy #0
+; Always measured for real, regardless of whether any album in this ROM
+; declares itself dual-region-aware: the per-track PLAY-rate throttle
+; below needs to know the *actual* hardware rate to work at all, not just
+; tunes that opted into self-compensation.
+.segment "ALIGN"
+.proc detect_region
+	.align 32
+	ldx #0
+	ldy #0
+	lda nmi_count
+	@wait1:
+		cmp nmi_count
+		beq @wait1
 		lda nmi_count
-		@wait1:
-			cmp nmi_count
-			beq @wait1
-			lda nmi_count
-		@wait2:
-			inx
-			bne :+
-				iny
-			:
-			cmp nmi_count
-			beq @wait2
-		tya
-		sec
-		sbc #10
-		rts
-	.endproc
-.else
-	.segment "CODE"
-	.proc detect_region
-		lda #(eNSF::REGION & 1)
-		rts
-	.endproc
-.endif
+	@wait2:
+		inx
+		bne :+
+			iny
+		:
+		cmp nmi_count
+		beq @wait2
+	tya
+	sec
+	sbc #10
+	rts
+.endproc
 
 .segment "VECTORS"
 .addr vec_nmi
@@ -1165,9 +1257,25 @@ INES_MAPPER = MAPPER
 INES_MIRROR = 1
 INES_SRAM   = 0
 .byte 'N', 'E', 'S', $1A
-.byte BANKS / 4
-.byte INES_CHR
-.byte INES_MIRROR | (INES_SRAM << 1) | ((INES_MAPPER & $f) << 4)
-.byte (INES_MAPPER & %11110000)
-.byte $0, $0, $0, $0, $0, $0, $0, $0
+.byte BANKS / 4                                    ; PRG-ROM size, 16K units
+.byte INES_CHR                                      ; CHR-ROM size, 8K units
+.byte INES_MIRROR | (INES_SRAM << 1) | ((INES_MAPPER & $0f) << 4)
+.byte $08 | (INES_MAPPER & $f0)                     ; %1000 = NES 2.0 identifier bits
+.byte 0                                             ; mapper bits 8-11 / submapper (mapper 31 fits in 8 bits)
+.byte 0                                             ; PRG/CHR size MSB (sizes here always fit in the bytes above)
+.byte 0                                             ; PRG-RAM/NVRAM size: none
+.if INES_CHR = 0
+	.byte $07                                       ; CHR-RAM size: 64 << 7 = 8K (this driver draws into CHR-RAM)
+.else
+	.byte 0                                         ; real CHR-ROM is supplied instead, see byte 5 above
+.endif
+; This ROM measures the real console's region at boot and adapts (see
+; detect_region/vec_reset and the PLAY-rate throttle in play_play) rather
+; than assuming one -- declare that honestly instead of leaving this
+; NES 1.0-era byte at its default of "NTSC only", which is what led some
+; emulators to disregard a manually forced PAL region for this mapper.
+.byte 2                                             ; CPU/PPU timing: 2 = NTSC and PAL both supported
+.byte 0                                             ; VS System / extended console type: none
+.byte 0                                             ; number of miscellaneous ROMs: none
+.byte 0                                             ; default expansion device: unspecified
 

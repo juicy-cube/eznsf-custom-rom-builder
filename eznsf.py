@@ -139,6 +139,16 @@ for i in range(len(album_lines)):
         if len(nsf_albums) > 0:
             nsf_albums[-1]["artist"] = artist_val
         nsf_artist = artist_val
+    elif c == "REGION":
+        # Overrides a mislabeled NSF header's declared region (common on
+        # ripped/homebrew files where the region byte was never set
+        # correctly) for the purpose of the PLAY-rate throttle below --
+        # doesn't touch the tune's own dual-region flag or its INIT call.
+        if len(tokens) != 2 or tokens[1].upper() not in ("NTSC", "PAL"):
+            line_error("REGION expects NTSC or PAL.")
+        if len(nsf_albums) == 0:
+            line_error("REGION specified before any NSF line.")
+        nsf_albums[-1]["region_override"] = 0 if tokens[1].upper() == "NTSC" else 1
     elif c == "LOOPTIME":
         time_str = l[l.find(c) + len(c) + 1:].strip()
         if ':' in time_str:
@@ -323,6 +333,23 @@ for orig_idx, alb in enumerate(nsf_albums):
     init_addr = nsf[0x0A] + (nsf[0x0B] << 8)
     play_addr = nsf[0x0C] + (nsf[0x0D] << 8)
     region = nsf[0x7A]
+    speed_ntsc = nsf[0x6E] + (nsf[0x6F] << 8)
+    speed_pal = nsf[0x78] + (nsf[0x79] << 8)
+    # The rate this tune actually expects PLAY to be called at, in Hz.
+    # Only meaningful for non-dual-region NSFs (see rate_table below) --
+    # a dual-region-aware tune is expected to compensate for the real
+    # detected hardware rate internally instead.
+    #
+    # Deliberately NOT derived from the header's own speed_ntsc/speed_pal
+    # fields: those are frequently garbage for whichever region a
+    # single-region NSF *wasn't* authored for (nothing ever reads them,
+    # so nothing ever catches them being wrong), and the builder GUI
+    # always writes an explicit REGION now anyway. A plain, predictable
+    # 60 or 50 keeps the throttle's behavior exactly matching whatever
+    # NTSC/PAL choice was actually made in album.txt/the GUI.
+    region_override = alb.get("region_override")
+    effective_pal = region_override if region_override is not None else (region & 1)
+    target_hz = 50 if effective_pal else 60
     banked = False
 
     for i in range(8):
@@ -353,11 +380,29 @@ for orig_idx, alb in enumerate(nsf_albums):
     f000_local = bank[7]
     rom = bytearray([0] * rom_padding) + nsf[0x80:]
 
+    # Detect (not measure precisely -- see nsf_patch.measure_pal_compensation's
+    # own notes on why only the yes/no answer is trusted) whether this
+    # tune's own engine self-compensates tempo based on the real region
+    # passed via X at INIT, independent of anything this driver does.
+    # FamiTracker's compiled driver applies exactly 6/5 when it does this,
+    # regardless of the specific tune -- so once compensation is detected
+    # at all, that known-exact constant is used rather than the noisy
+    # measured ratio.
+    try:
+        import nsf_patch
+        compensates = nsf_patch.measure_pal_compensation(
+            rom, bank, init_addr, play_addr, nsf[0x06]) > 1.0
+    except ImportError:
+        compensates = False
+
     alb.update({
         "nsf": nsf, "bank": bank, "banked": banked,
         "load_addr": load_addr, "init_addr": init_addr, "play_addr": play_addr,
         "region": region, "rom_padding": rom_padding, "highest_bank": highest_bank,
         "f000_local": f000_local, "rom": rom, "song_count": nsf[0x06],
+        "target_hz": target_hz,
+        "effective_pal": effective_pal,
+        "compensates": compensates,
     })
 
     if nsf_autofix:
@@ -413,6 +458,16 @@ for orig_idx, alb in enumerate(nsf_albums):
     print("  INIT: %04X" % init_addr)
     print("  PLAY: %04X" % play_addr)
     print("  ROM size: %d bytes" % len(rom))
+    if region & 2:
+        print("  REGION: dual (tune compensates for real hardware region itself)")
+    else:
+        override_note = " (overridden by REGION directive)" if region_override is not None else ""
+        print("  REGION: %s, PLAY throttled to %d Hz%s"
+              % ("PAL" if effective_pal else "NTSC", target_hz, override_note))
+        if compensates:
+            print("  REGION: engine self-compensates ~1.20x for real PAL hardware "
+                  "-- call rate on real PAL adjusted to %d Hz to cancel it out"
+                  % max(1, round(target_hz * 5.0 / 6.0)))
 print()
 
 if nsf_dropped:
@@ -854,6 +909,27 @@ for idx in range(len(nsf_albums)):
 s += "\tartist_table:\n"
 for idx in range(len(nsf_albums)):
     s += "\t\t.addr dString::artist_%02d\n" % idx
+s += "\trate_table:\n"
+for idx in range(len(nsf_albums)):
+    s += "\t\t.byte %d ; Hz this album's tune actually expects PLAY to run at\n" % nsf_albums[idx]["target_hz"]
+s += "\trate_table_pal_adjusted:\n"
+for idx in range(len(nsf_albums)):
+    # Used instead of rate_table when the real hardware turns out to be
+    # PAL (see play_init) for a tune detected to self-compensate tempo
+    # via X (see "compensates" above): pre-dividing our own call-rate
+    # target by that same known 6/5 cancels the tune's own multiplication
+    # back out, so the combined *result* lands on the declared target
+    # instead of overshooting it. Identical to rate_table for anything
+    # not detected to compensate, so this never second-guesses a tune
+    # that doesn't need it -- play_play's rate converter can hit either
+    # table exactly regardless of the real native rate either way.
+    if nsf_albums[idx].get("compensates"):
+        s += "\t\t.byte %d\n" % max(1, round(nsf_albums[idx]["target_hz"] * 5.0 / 6.0))
+    else:
+        s += "\t\t.byte %d\n" % nsf_albums[idx]["target_hz"]
+s += "\tdual_table:\n"
+for idx in range(len(nsf_albums)):
+    s += "\t\t.byte %d ; 1 = tune claims to compensate for region itself, no throttling needed\n" % (1 if (nsf_albums[idx]["region"] & 2) else 0)
 s += ".endscope\n\n"
 
 s += ".scope dTrack\n"

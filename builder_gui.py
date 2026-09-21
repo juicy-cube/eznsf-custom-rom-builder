@@ -18,7 +18,8 @@ def parse_nsf_tags(filepath):
             artist = header[0x2E:0x4E].split(b'\x00')[0].decode('utf-8', 'ignore').strip()
             copyright_val = header[0x4E:0x6E].split(b'\x00')[0].decode('utf-8', 'ignore').strip()
             song_count = header[0x06]
-            return {'title': title, 'artist': artist, 'copyright': copyright_val, 'songs': song_count}
+            region = 'PAL' if (header[0x7A] & 1) else 'NTSC'
+            return {'title': title, 'artist': artist, 'copyright': copyright_val, 'songs': song_count, 'region': region}
     except Exception:
         return None
 
@@ -31,6 +32,11 @@ class EZNSFBuilder(TkinterDnD.Tk):
         # Maps tree item id -> full NSF path, since the tree only displays
         # the basename. Lets NSFs live anywhere, not just the project root.
         self.nsf_full_paths = {}
+        # Maps a full NSF path -> "NTSC" / "PAL": the region the PLAY-rate
+        # throttle should target for that file. Defaults to whatever the
+        # NSF's own header declares, but is editable per file (double-click
+        # the Region column) for headers that are simply mislabeled.
+        self.nsf_region = {}
         
         self.rom_settings_frame = ttk.LabelFrame(self, text="ROM Settings")
         self.rom_settings_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -77,7 +83,7 @@ class EZNSFBuilder(TkinterDnD.Tk):
         
         self.tree = ttk.Treeview(
             self.list_frame, 
-            columns=("File", "Subsong", "Artist", "Title", "Copyright", "Time"), 
+            columns=("File", "Subsong", "Artist", "Title", "Copyright", "Time", "Region"),
             show="headings", 
             selectmode="extended"
         )
@@ -87,6 +93,7 @@ class EZNSFBuilder(TkinterDnD.Tk):
         self.tree.heading("Title", text="Title")
         self.tree.heading("Copyright", text="Copyright")
         self.tree.heading("Time", text="Time")
+        self.tree.heading("Region", text="Region")
         
         self.tree.column("File", width=50, stretch=True)
         self.tree.column("Subsong", width=60, stretch=False, anchor="center")
@@ -94,6 +101,7 @@ class EZNSFBuilder(TkinterDnD.Tk):
         self.tree.column("Title", width=150, stretch=True)
         self.tree.column("Copyright", width=100, stretch=True)
         self.tree.column("Time", width=80, stretch=False, anchor="center")
+        self.tree.column("Region", width=70, stretch=False, anchor="center")
         self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         self.tree.bind("<Double-1>", self.on_double_click)
@@ -104,8 +112,8 @@ class EZNSFBuilder(TkinterDnD.Tk):
         self.btn_frame = ttk.Frame(self)
         self.btn_frame.pack(fill=tk.X, padx=10, pady=10)
         ttk.Button(self.btn_frame, text="Add NSF Manually", command=self.add_nsf).pack(side=tk.LEFT, padx=5)
-        ttk.Button(self.btn_frame, text="Load Album", command=self.load_album).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.btn_frame, text="Clear List", command=self.clear_list).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.btn_frame, text="Load Album", command=self.load_album).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.btn_frame, text="Save album.txt as...", command=self.save_album_as).pack(side=tk.LEFT, padx=5)
         
         bold_style = ttk.Style()
@@ -113,16 +121,21 @@ class EZNSFBuilder(TkinterDnD.Tk):
         self.build_button = ttk.Button(self.btn_frame, text="Build ROM", style="Bold.TButton", command=self.build_rom)
         self.build_button.pack(side=tk.RIGHT, padx=5)
 
-    def add_item_to_tree(self, file_name, subsong, artist, title, copyright_val, time_val, full_path=None):
-        iid = self.tree.insert("", "end", values=(file_name, subsong, artist, title, copyright_val, time_val))
+    def add_item_to_tree(self, file_name, subsong, artist, title, copyright_val, time_val, full_path=None, region=None):
+        full_path = full_path if full_path else file_name
+        if region is None:
+            region = self.nsf_region.get(full_path, "NTSC")
+        self.nsf_region.setdefault(full_path, region)
+        iid = self.tree.insert("", "end", values=(file_name, subsong, artist, title, copyright_val, time_val, region))
         # Remember the real source path (may be outside the project folder);
         # the tree cell only ever shows the basename.
-        self.nsf_full_paths[iid] = full_path if full_path else file_name
+        self.nsf_full_paths[iid] = full_path
         return iid
 
     def clear_list(self):
         self.tree.delete(*self.tree.get_children())
         self.nsf_full_paths.clear()
+        self.nsf_region.clear()
 
     def move_up(self):
         for item in self.tree.selection():
@@ -156,7 +169,21 @@ class EZNSFBuilder(TkinterDnD.Tk):
         
         values = self.tree.item(item, 'values')
         current_value = str(values[col_index])
-        
+
+        if self.tree["columns"][col_index] == "Region":
+            # Toggle rather than free-text edit, and keep every row that
+            # shares this NSF file in sync -- region is really a per-file
+            # property, just shown on every one of that file's rows.
+            new_region = "PAL" if current_value == "NTSC" else "NTSC"
+            nsf_path = self.nsf_full_paths.get(item)
+            self.nsf_region[nsf_path] = new_region
+            for iid, path in self.nsf_full_paths.items():
+                if path == nsf_path:
+                    row_values = list(self.tree.item(iid, 'values'))
+                    row_values[col_index] = new_region
+                    self.tree.item(iid, values=row_values)
+            return
+
         entry = ttk.Entry(self.tree)
         entry.place(x=x, y=y, width=width, height=height)
         entry.insert(0, current_value)
@@ -194,10 +221,12 @@ class EZNSFBuilder(TkinterDnD.Tk):
         copyright_val = tags['copyright'] if (tags and tags['copyright']) else ""
         song_count = tags['songs'] if tags else 1
         base_title = tags['title'] if (tags and tags['title']) else "Track"
-        
+        region = tags['region'] if tags else "NTSC"
+        self.nsf_region[file_path] = region
+
         for i in range(1, song_count + 1):
             track_title = f"{base_title} - {i}" if song_count > 1 else base_title
-            self.add_item_to_tree(filename, str(i), artist, track_title, copyright_val, "LOOP", full_path=file_path)
+            self.add_item_to_tree(filename, str(i), artist, track_title, copyright_val, "LOOP", full_path=file_path, region=region)
 
     def load_album(self):
         path = filedialog.askopenfilename(filetypes=[("Album files", "*.txt"), ("All files", "*.*")])
@@ -212,6 +241,7 @@ class EZNSFBuilder(TkinterDnD.Tk):
 
         self.tree.delete(*self.tree.get_children())
         self.nsf_full_paths.clear()
+        self.nsf_region.clear()
         self.info_text.delete("1.0", tk.END)
 
         album_dir = os.path.dirname(os.path.abspath(path))
@@ -234,6 +264,7 @@ class EZNSFBuilder(TkinterDnD.Tk):
         pending = {}
         track_order = []
         info_lines = []
+        region_overrides = {}  # raw NSF-line text -> "NTSC" / "PAL"
 
         def flush_pending():
             for tnum in sorted(pending.keys(), key=lambda k: int(k) if str(k).isdigit() else k):
@@ -284,6 +315,8 @@ class EZNSFBuilder(TkinterDnD.Tk):
                 current_artist = "Unknown Artist"
             elif cmd == "ARTIST":
                 current_artist = rest
+            elif cmd == "REGION":
+                region_overrides[current_nsf] = "PAL" if rest.strip().upper() == "PAL" else "NTSC"
             elif cmd == "TRACK":
                 tparts = rest.split(None, 1)
                 if len(tparts) >= 1:
@@ -321,7 +354,16 @@ class EZNSFBuilder(TkinterDnD.Tk):
         for t in track_order:
             full_path = resolve_nsf_path(t["nsf"])
             display_name = os.path.basename(full_path) if full_path else t["nsf"]
-            self.add_item_to_tree(display_name, t["subsong"], t["artist"], t["title"], t["copy"], t["time"], full_path=full_path)
+            if t["nsf"] in region_overrides:
+                region = region_overrides[t["nsf"]]
+            else:
+                # No explicit REGION line for this NSF -- fall back to
+                # whatever its own header declares, same as adding it fresh.
+                tags = parse_nsf_tags(full_path) if full_path else None
+                region = tags['region'] if tags else "NTSC"
+            self.nsf_region[full_path] = region
+            self.add_item_to_tree(display_name, t["subsong"], t["artist"], t["title"], t["copy"], t["time"],
+                                   full_path=full_path, region=region)
 
         messagebox.showinfo("Success", f"Loaded album from:\n{path}")
                 
@@ -355,12 +397,16 @@ class EZNSFBuilder(TkinterDnD.Tk):
             # text (e.g. a copyright of just "2026") back to int/float
             # when read via item()["values"], so every field needs an
             # explicit str() here regardless of what it looks like.
-            file_name, subsong, artist, title, copyright_val, time_val = (str(v) for v in row)
+            file_name, subsong, artist, title, copyright_val, time_val, region_val = (str(v) for v in row)
             nsf_path = self.nsf_full_paths.get(child, file_name)
 
             if nsf_path != current_nsf:
                 lines.append(f"\nNSF {nsf_path}")
                 lines.append(f"ARTIST {artist}")
+                # Always written explicitly, same reasoning as AUTOFIX/
+                # AUTONUMERATE above -- the ROM should always end up built
+                # for the region actually chosen, not eznsf.py's default.
+                lines.append("REGION " + self.nsf_region.get(nsf_path, region_val))
                 current_nsf = nsf_path
                 current_artist = artist
             elif artist != current_artist:
@@ -372,9 +418,9 @@ class EZNSFBuilder(TkinterDnD.Tk):
             if copyright_val.strip():
                 lines.append(f"COPY {subsong} {copyright_val}")
 
-        lines.append("\nSCREEN INFO   screen.nam   tiles.chr tiles.chr colors.pal colors.pal")
-        lines.append("SCREEN TRACKS screen.nam tiles.chr tiles.chr colors.pal colors.pal")
-        lines.append("SCREEN PLAY   screen.nam   tiles.chr tiles.chr colors.pal colors.pal")
+        lines.append("\nSCREEN INFO   screen.map   tiles.chr tiles.chr colors.pal colors.pal")
+        lines.append("SCREEN TRACKS menu.map tiles.chr tiles.chr colors.pal colors.pal")
+        lines.append("SCREEN PLAY   screen.map   tiles.chr tiles.chr colors.pal colors.pal")
 
         lines.append("\nCOORD INFO              2 2")
         lines.append("COORD TRACKS_TITLE      2 2")
